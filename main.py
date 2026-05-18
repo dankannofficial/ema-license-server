@@ -25,7 +25,33 @@ async def _init_db():
                 last_seen   TEXT
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS announcements (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                version    TEXT    NOT NULL,
+                message    TEXT    NOT NULL DEFAULT '',
+                link       TEXT    NOT NULL DEFAULT '',
+                active     INTEGER DEFAULT 1,
+                created_at TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        # Migrazione: aggiungi colonna link se non esiste
+        try:
+            await db.execute("ALTER TABLE announcements ADD COLUMN link TEXT NOT NULL DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass
         await db.commit()
+
+
+async def _get_active_announcement() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM announcements WHERE active=1 ORDER BY id DESC LIMIT 1"
+        ) as c:
+            row = await c.fetchone()
+    return dict(row) if row else {}
 
 
 @asynccontextmanager
@@ -91,8 +117,14 @@ async def verify(body: dict = Body(...)):
                 "UPDATE licenses SET last_seen=datetime('now') WHERE license_key=?", (key,))
             await db.commit()
 
-    return {"valid": True, "plan": lic["plan"],
-            "expires_at": lic["expires_at"], "reason": ""}
+    ann = await _get_active_announcement()
+    return {
+        "valid":        True,
+        "plan":         lic["plan"],
+        "expires_at":   lic["expires_at"],
+        "reason":       "",
+        "announcement": {"version": ann["version"], "message": ann["message"], "link": ann.get("link","")} if ann else None,
+    }
 
 
 # ── Admin: lista licenze ──────────────────────────────────────────────────────
@@ -219,6 +251,32 @@ async def delete_license(key: str, _=Depends(_admin)):
             "DELETE FROM licenses WHERE license_key=?", (key.upper(),))
         await db.commit()
     return {"ok": True}
+
+
+# ── Admin: annunci aggiornamento ──────────────────────────────────────────────
+@app.put("/admin/announcement")
+async def set_announcement(body: dict = Body(...), _=Depends(_admin)):
+    version = (body.get("version") or "").strip()
+    message = (body.get("message") or "").strip()
+    link    = (body.get("link")    or "").strip()
+    active  = int(body.get("active", 1))
+    if not version:
+        raise HTTPException(400, "version obbligatorio")
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Disattiva tutti i precedenti
+        await db.execute("UPDATE announcements SET active=0")
+        if active:
+            await db.execute(
+                "INSERT INTO announcements (version, message, link, active) VALUES (?,?,?,1)",
+                (version, message, link))
+        await db.commit()
+    return {"ok": True}
+
+
+@app.get("/admin/announcement")
+async def get_announcement(_=Depends(_admin)):
+    ann = await _get_active_announcement()
+    return ann if ann else {"version": "", "message": "", "active": 0}
 
 
 # ── Health check ───────────────────────────────────────────────────────────────
